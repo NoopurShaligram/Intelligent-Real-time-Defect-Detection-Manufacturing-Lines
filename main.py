@@ -1,70 +1,109 @@
 import os
+import cv2
+import torch
+import serial
+import time
 import numpy as np
-from PIL import Image
-import albumentations as A
 from ultralytics import YOLO
 
-# Paths
-DATASET_DIR = r"C:\Users\vimud\Downloads\dataset"
-OUTPUT_DIR = r"./output"
-YAML_PATH = r"C:\Users\vimud\Downloads\dataset\data.yaml"
-AUGMENTED_DIR = r"./augmented_images"
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    print("Error: 'picamera2' module not found. Install it using:")
+    print("sudo apt install python3-picamera2")
+    exit(1)
 
-# Augmentation (Simplified)
-transform = A.Compose([
-    A.RandomRotate90(p=0.5),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomBrightnessContrast(p=0.3),
-    A.Blur(blur_limit=3, p=0.2),
-    A.Affine(rotate=(-10, 10), scale=(0.95, 1.05), translate_percent=(-0.05, 0.05), p=0.4),
-    A.GaussNoise(p=0.2),
-    A.MotionBlur(p=0.1),
-    A.CLAHE(p=0.1),
-])
+# === CONFIG ===
+MODEL_PATH = "best.pt"
+SERIAL_PORT = "/dev/ttyACM0"   # Update if your Arduino is on a different port
+BAUD_RATE = 9600
+CLASS_TO_COMMAND = {
+    'nut': 'A',
+    'bolt': 'B',
+    'washer': 'C',
+    'defected_nut': 'D',
+    'defected_bolt': 'D',
+    'defected_washer': 'D'
+}
+CONF_THRESHOLD = 0.5
+OUTPUT_DIR = "./output"
 
+# === SETUP SERIAL ===
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)  # Wait for Arduino to reset
+    print("Serial connected to Arduino.")
+except Exception as e:
+    print(f"Error connecting to Arduino: {e}")
+    arduino = None
 
+def setup_camera():
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(main={"size": (640, 480)})
+        picam2.configure(config)
+        picam2.start()
+        return picam2
+    except Exception as e:
+        print(f"Camera error: {e}")
+        exit(1)
 
-# Augment "imagebolt" and "washer" images
-def augment_bolt_images():
-    os.makedirs(AUGMENTED_DIR, exist_ok=True)
-    for filename in os.listdir(DATASET_DIR):
-        if filename.startswith(('imagebolt', 'washer')):  # Augment only these
-            img_path = os.path.join(DATASET_DIR, filename)
-            img = np.array(Image.open(img_path))
-            augmented = transform(image=img)['image']
-            Image.fromarray(augmented).save(os.path.join(AUGMENTED_DIR, f"aug_{filename}"))
-    print("Augmentation done.")
+def detect_from_camera(model):
+    picam2 = setup_camera()
+    print("Press 'q' to exit detection...")
 
-# Train YOLOv8n on custom dataset
-def train_model(yaml_path, epochs=150, batch_size=16, imgsz=640, lr0=0.001,lrf=0.01, optimizer="AdamW", patience = 20, augment =True):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    best_model_path = os.path.join(OUTPUT_DIR, 'bolt_model5', 'weights', 'best.pt')
+    while True:
+        try:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            results = model(frame, conf=CONF_THRESHOLD, iou=0.5, verbose=False)[0]
 
-    if os.path.exists(best_model_path):
-        print(f"Best model found at {best_model_path}, skipping training.")
-        return YOLO(best_model_path)
+            boxes = results.boxes.xyxy.cpu().numpy()
+            confs = results.boxes.conf.cpu().numpy()
+            cls_ids = results.boxes.cls.cpu().numpy().astype(int)
+            class_names = model.names
 
-    model = YOLO('yolov8n.pt')
+            if len(confs) > 0:
+                top_idx = int(np.argmax(confs))
+                class_name = class_names[cls_ids[top_idx]]
 
-    model.train(
-        data=yaml_path,
-        epochs=epochs,
-        batch=batch_size,
-        imgsz=imgsz,
-        save=True,
-        project=OUTPUT_DIR,
-        name='bolt_model',
-    )
+                print(f"Detected: {class_name} ({confs[top_idx]:.2f})")
 
-    print("Training done.")
-    return YOLO(best_model_path)
+                # Send command to Arduino
+                if class_name in CLASS_TO_COMMAND and arduino:
+                    command = CLASS_TO_COMMAND[class_name]
+                    print(f"Sending command '{command}' to Arduino")
+                    arduino.write(command.encode())
+                    time.sleep(1)  # Wait between commands
 
-# Main function
+            # Annotate frame
+            for box, conf, cls_id in zip(boxes, confs, cls_ids):
+                x1, y1, x2, y2 = map(int, box)
+                label = f"{class_names[cls_id]}: {conf:.2f}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+
+            cv2.imshow("YOLOv8 Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        except Exception as e:
+            print(f"Error during detection: {e}")
+            break
+
+    print("Stopping...")
+    picam2.stop()
+    cv2.destroyAllWindows()
+
 def main():
-    augment_bolt_images()
-    model = train_model(YAML_PATH)
+    print("Loading model...")
+    try:
+        model = YOLO(MODEL_PATH)
+    except Exception as e:
+        print(f"Failed to load YOLO model: {e}")
+        return
+
+    detect_from_camera(model)
 
 if __name__ == "__main__":
     main()
